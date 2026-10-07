@@ -429,15 +429,33 @@ static int mimiLocalSpaceIndex(uint64_t sid, uint32_t did) {
 	return 0;
 }
 
+/// Return the sign macOS 27 reads from its raw HID dock-swipe payload. The
+/// setting reverses synthetic swipes too, so it cannot use the gesture's
+/// logical direction unchanged.
+static double mimiAugmentedDockSwipeSign(double sign) {
+	bool naturalScrolling = true;
+	CFPropertyListRef value =
+	    CFPreferencesCopyAppValue(CFSTR("com.apple.swipescrolldirection"), kCFPreferencesAnyApplication);
+	if (value) {
+		if (CFGetTypeID(value) == CFBooleanGetTypeID()) {
+			naturalScrolling = CFBooleanGetValue((CFBooleanRef)value);
+		}
+
+		CFRelease(value);
+	}
+
+	return naturalScrolling ? -sign : sign;
+}
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 /// Build one phase of a synthetic dock swipe for macOS 27+, carrying both the
 /// extra gesture fields and the serialized IOHID payload the Dock now reads.
 /// @param phase kCGSGesturePhase value for this event
-/// @param sign Direction of travel through the display's space ordering
+/// @param rawSign Direction as the Dock's raw HID payload reads it
 /// @return Retained CGEventRef (caller must CFRelease), or NULL on failure
-static CGEventRef mimiCreateAugmentedDockSwipeEvent(int phase, double sign) {
+static CGEventRef mimiCreateAugmentedDockSwipeEvent(int phase, double rawSign) {
 	CGEventRef event = CGEventCreate(NULL);
 	if (!event) {
 		return NULL;
@@ -449,16 +467,14 @@ static CGEventRef mimiCreateAugmentedDockSwipeEvent(int phase, double sign) {
 	CGEventSetIntegerValueField(event, kMimiCGEventGesturePhase, phase);
 	CGEventSetIntegerValueField(event, kMimiCGEventGesturePhaseAlias, phase);
 
-	// The payload is read with the raw HID sign convention, which runs opposite
-	// to the space-index direction used everywhere else here.
-	CGEventSetDoubleValueField(event, kMimiCGEventGestureSwipeProgress, -sign);
+	CGEventSetDoubleValueField(event, kMimiCGEventGestureSwipeProgress, rawSign);
 	CGEventSetDoubleValueField(event, kMimiCGEventGestureSwipePositionX, kMimiDockSwipeAugmentedPositionX);
 	CGEventSetDoubleValueField(event, kMimiCGEventGestureZoomDeltaY, kMimiDockSwipeAugmentedZoomDeltaY);
 	CGEventSetDoubleValueField(event, kMimiCGEventSourceUnixProcessIDAlias, (double)mach_absolute_time());
 
 	// Only the ending phase carries velocity, matching a real trackpad lift.
 	if (phase == kMimiCGSGesturePhaseEnded) {
-		CGEventSetDoubleValueField(event, kMimiCGEventGestureSwipeVelocityX, -sign * kMimiDockSwipeVelocity);
+		CGEventSetDoubleValueField(event, kMimiCGEventGestureSwipeVelocityX, rawSign * kMimiDockSwipeVelocity);
 	}
 
 	CGEventRef augmented = MimiDockSwipeAugment(event);
@@ -473,11 +489,13 @@ static CGEventRef mimiCreateAugmentedDockSwipeEvent(int phase, double sign) {
 /// @return true if every phase was posted
 static bool mimiPostAugmentedDockSwipe(double sign) {
 	static const int phases[] = {kMimiCGSGesturePhaseBegan, kMimiCGSGesturePhaseChanged, kMimiCGSGesturePhaseEnded};
+	double rawSign = mimiAugmentedDockSwipeSign(sign);
 
 	for (size_t i = 0; i < sizeof(phases) / sizeof(phases[0]); i++) {
-		CGEventRef event = mimiCreateAugmentedDockSwipeEvent(phases[i], sign);
-		if (!event)
+		CGEventRef event = mimiCreateAugmentedDockSwipeEvent(phases[i], rawSign);
+		if (!event) {
 			return false;
+		}
 
 		CGEventPost(kCGSessionEventTap, event);
 		CFRelease(event);
